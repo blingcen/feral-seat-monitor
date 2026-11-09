@@ -1,17 +1,21 @@
-name: FERAL Seats Monitor
+name: Ticketlink Multi-event Monitor
+
 on:
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch:
+
 permissions:
   contents: read
+
 concurrency:
-  group: feral-seat-monitor
+  group: ticketlink-multi-event-monitor
   cancel-in-progress: false
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,11 +26,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
-      - name: Check Ticketlink
+      - name: Inspect configured Ticketlink events
         env:
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          EMAIL_TO: ${{ vars.FERAL_EMAIL_TO }}
+          FORCE_CHECK: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: python monitor.py
+      - name: Upload inspection report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ticketlink-inspection-${{ github.run_id }}
+          path: monitor-results.json
+          if-no-files-found: ignore
+          retention-days: 7
