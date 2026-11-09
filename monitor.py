@@ -1,101 +1,144 @@
+"""Ticketlink multi-event public-page monitor.
+
+Only public, explicitly stated numeric availability can be classified as available.
+Dynamic seat-map inventories require an independently validated, authorized adapter.
+Never signs in, bypasses queues/captcha, selects seats or purchases tickets.
+"""
 import json
 import os
 import re
 import smtplib
-from email.message import EmailMessage
 from datetime import datetime
-from zoneinfo import ZoneInfo
+from email.message import EmailMessage
 from pathlib import Path
+from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
+
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-URL = "https://www.ticketlink.co.kr/global/en/product/65790"
+ROOT = Path(__file__).resolve().parent
+CONFIG = ROOT / "monitor-config.json"
 TZ = ZoneInfo("Asia/Taipei")
-CONFIG_PATH = Path(__file__).with_name("monitor-config.json")
-DEFAULT_CONFIG = {"enabled": True, "email": "vlln5330@hotmail.com", "target_date": "2026-11-29", "product_url": URL}
+# Intentionally conservative: only explicit English/Korean counts are parsed.
+COUNT_PATTERNS = [
+    re.compile(r"(?:available seats?|remaining seats?)\s*[:：]?\s*(\d{1,5})", re.I),
+    re.compile(r"(?:잔여석|남은 좌석)\s*[:：]?\s*(\d{1,5})", re.I),
+]
 
-ACTION_WORDS = re.compile(r"(select seat|available seat|book now|reserve|purchase|예매하기|좌석 선택|예약하기|구매하기)", re.I)
-DISABLED_WORDS = re.compile(r"(sold out|unavailable|매진|판매 종료|예매 종료)", re.I)
-AREA_WORDS = re.compile(r"(FERAL|페럴|페럴석|floor|section|area|zone|석|구역)", re.I)
+def valid_url(value):
+    try:
+        u = urlparse(value)
+        return u.scheme == "https" and u.hostname in {"www.ticketlink.co.kr", "ticketlink.co.kr"} and u.username is None and u.password is None and u.port in (None, 443)
+    except (ValueError, TypeError):
+        return False
 
 def load_config():
+    data = json.loads(CONFIG.read_text(encoding="utf-8"))
+    if not isinstance(data.get("events"), list):
+        raise ValueError("Config requires an events list")
+    return data
+
+def should_run(event, now):
+    interval = int(event.get("interval_minutes", 5))
+    if interval not in (5, 10, 15, 30):
+        raise ValueError("Interval must be 5, 10, 15 or 30")
+    return (now.minute // 5) % (interval // 5) == 0
+
+def inspect(browser, event):
+    url = event["url"]
+    if not valid_url(url):
+        return {"status": "error", "reason": "Invalid Ticketlink URL"}
+    page = browser.new_page(locale="en-US", timezone_id="Asia/Seoul")
     try:
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        return {**DEFAULT_CONFIG, **data}
-    except Exception as exc:
-        print(f"Could not read monitor-config.json; using defaults: {exc}")
-        return DEFAULT_CONFIG.copy()
-
-def inspect_page():
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(2000)
         try:
-            page = browser.new_page(locale="en-US", timezone_id="Asia/Seoul")
-            response = page.goto(URL, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(5000)
-            try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except PlaywrightTimeoutError:
-                pass
-            title = page.title()
-            body = page.locator("body").inner_text(timeout=10000)
-            buttons = page.locator("button, a, [role='button']")
-            actions = []
-            for i in range(min(buttons.count(), 300)):
-                el = buttons.nth(i)
-                try:
-                    label = " ".join(el.inner_text(timeout=500).split())
-                    if not label or not ACTION_WORDS.search(label):
-                        continue
-                    disabled = el.get_attribute("disabled") is not None or el.get_attribute("aria-disabled") == "true"
-                    cls = (el.get_attribute("class") or "").lower()
-                    if disabled or "disabled" in cls or DISABLED_WORDS.search(label):
-                        continue
-                    actions.append(label[:160])
-                except Exception:
-                    continue
-            areas = sorted({a for a in actions if AREA_WORDS.search(a)})
-            context = bool(re.search(r"(FERAL|페럴).{0,80}(seat|석|section|zone|구역)|(seat|석|section|zone|구역).{0,80}(FERAL|페럴)", body, re.I | re.S))
-            return {"available": bool(areas and context), "areas": areas, "status": response.status if response else None,
-                    "title": title, "diagnostic": " | ".join(actions[:12]), "body_excerpt": body[:1800]}
-        finally:
-            browser.close()
+            page.wait_for_load_state("networkidle", timeout=5000)
+        except PlaywrightTimeoutError:
+            pass
+        body = page.locator("body").inner_text(timeout=10000)
+        title = page.title()
+        http = response.status if response else None
+        if http != 200:
+            return {"status": "unknown", "reason": f"HTTP {http}", "http": http}
+        if re.search(r"captcha|verify you are human|접근이 제한|access denied", body, re.I):
+            return {"status": "unknown", "reason": "Access verification required"}
+        keywords = [x.strip() for x in event.get("seat_keywords", []) if isinstance(x, str) and x.strip()]
+        matches = []
+        for line in body.splitlines():
+            line = " ".join(line.split())
+            if not line:
+                continue
+            if keywords and not any(k.casefold() in line.casefold() for k in keywords):
+                continue
+            for pattern in COUNT_PATTERNS:
+                m = pattern.search(line)
+                if m:
+                    matches.append({"label": line[:160], "count": int(m.group(1))})
+                    break
+        # Generic count lines can indicate a whole event, not the requested seat type.
+        # We do not claim a particular area is available unless its label is on the same line.
+        if matches:
+            count = sum(x["count"] for x in matches)
+            return {"status": "available" if count > 0 else "sold_out", "count": count,
+                    "matches": matches[:20], "title": title, "http": http,
+                    "reason": "Explicit numeric availability text on public page"}
+        return {"status": "unknown", "reason": "No verifiable numeric seat inventory in public page",
+                "title": title, "http": http}
+    except Exception as exc:
+        return {"status": "error", "reason": str(exc)[:300]}
+    finally:
+        page.close()
 
-def send_email(subject, body, recipient):
-    host = os.environ["SMTP_HOST"]
-    port = int(os.environ.get("SMTP_PORT", "587"))
-    username = os.environ["SMTP_USERNAME"]
-    password = os.environ["SMTP_PASSWORD"]
+def send_email(to, subject, body):
+    required = ("SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD")
+    if not all(os.environ.get(k) for k in required):
+        print("Email skipped: SMTP secrets not configured")
+        return False
     msg = EmailMessage()
-    msg["From"] = username
-    msg["To"] = recipient
+    msg["From"] = os.environ["SMTP_USERNAME"]
+    msg["To"] = to
     msg["Subject"] = subject
     msg.set_content(body)
-    with smtplib.SMTP(host, port, timeout=30) as server:
+    with smtplib.SMTP(os.environ["SMTP_HOST"], int(os.environ.get("SMTP_PORT", "587")), timeout=30) as server:
         server.starttls()
-        server.login(username, password)
+        server.login(os.environ["SMTP_USERNAME"], os.environ["SMTP_PASSWORD"])
         server.send_message(msg)
+    return True
 
 def main():
     config = load_config()
-    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+    now = datetime.now(TZ)
     if not config.get("enabled", True):
-        print(f"Monitoring is paused in monitor-config.json at {now}.")
+        print("All monitoring paused")
         return
-    result = inspect_page()
-    print(f"Checked at {now}; HTTP={result['status']}; title={result['title']!r}; available={result['available']}")
-    print(f"Detected action labels: {result['diagnostic']}")
-    if result["available"]:
-        recipient = (os.environ.get("EMAIL_TO") or config.get("email") or DEFAULT_CONFIG["email"]).strip()
-        areas = "\n".join(f"- {x}" for x in result["areas"])
-        body = (f"偵測到 Ticketlink 頁面可能出現可購買的 FERAL 座位，請立即自行確認並完成購票。\n\n"
-                f"演出日期：{config.get('target_date', '2026-11-29')}\n檢查時間（台北）：{now}\n"
-                f"偵測到的區域／按鈕：\n{areas}\n\n購票連結：{config.get('product_url', URL)}\n\n"
-                "注意：這是自動偵測結果，請以 Ticketlink 實際購票頁面為準；本程式不會自動登入或購票。")
-        if all(os.environ.get(k) for k in ("SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD")):
-            send_email("🍇 出現葡萄", body, recipient)
-            print(f"Notification email sent to {recipient}.")
-        else:
-            print("Potential availability detected, but SMTP secrets are not configured; no email was sent.")
+    report = {"checked_at": now.isoformat(), "events": []}
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            for event in config["events"][:30]:
+                if not event.get("enabled", True):
+                    continue
+                if not should_run(event, now) and os.environ.get("FORCE_CHECK") != "1":
+                    continue
+                result = inspect(browser, event)
+                item = {"id": event.get("id"), "name": event.get("name"),
+                        "url": event.get("url"), **result}
+                report["events"].append(item)
+                print(json.dumps(item, ensure_ascii=False))
+                # Explicit numeric counts alone are not sufficient to prove seat selectability.
+                # Do not email unverified availability as if it were purchasable inventory.
+        finally:
+            browser.close()
+    output = ROOT / "monitor-results.json"
+    output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        lines = ["## Ticketlink monitor", "", "| 活動 | 狀態 | 說明 |", "|---|---|---|"]
+        for x in report["events"]:
+            lines.append(f"| {str(x.get('name', '')).replace('|', '/')} | {x['status']} | {str(x.get('reason', '')).replace('|', '/')} |")
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
 
 if __name__ == "__main__":
     main()
