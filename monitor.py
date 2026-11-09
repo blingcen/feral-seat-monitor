@@ -45,8 +45,8 @@ def should_run(event, now):
     return (now.minute // 5) % (interval // 5) == 0
 
 def inspect(browser, event):
-    url = event["url"]
-    if not valid_url(url):
+    url = event.get("schedule_url") or event["url"]
+    if not valid_url(url) or not valid_url(event["url"]):
         return {"status": "error", "reason": "Invalid Ticketlink URL"}
     page = browser.new_page(locale="en-US", timezone_id="Asia/Seoul")
     try:
@@ -60,9 +60,9 @@ def inspect(browser, event):
         title = page.title()
         http = response.status if response else None
         if http != 200:
-            return {"status": "unknown", "reason": f"HTTP {http}", "http": http}
+            return {"status": "unknown", "reason": f"HTTP {http}", "http": http, "source_url": url}
         if re.search(r"captcha|verify you are human|접근이 제한|access denied", body, re.I):
-            return {"status": "unknown", "reason": "Access verification required"}
+            return {"status": "unknown", "reason": "Access verification required", "source_url": url}
         keywords = [x.strip() for x in event.get("seat_keywords", []) if isinstance(x, str) and x.strip()]
         matches = []
         for line in body.splitlines():
@@ -80,13 +80,13 @@ def inspect(browser, event):
         # We do not claim a particular area is available unless its label is on the same line.
         if matches:
             count = sum(x["count"] for x in matches)
-            return {"status": "available" if count > 0 else "sold_out", "count": count,
-                    "matches": matches[:20], "title": title, "http": http,
-                    "reason": "Explicit numeric availability text on public page"}
+            return {"status": "unverified_count", "count": count,
+                    "matches": matches[:20], "title": title, "http": http, "source_url": url,
+                    "reason": "Public page displays numeric counts; seat selectability is NOT verified"}
         return {"status": "unknown", "reason": "No verifiable numeric seat inventory in public page",
-                "title": title, "http": http}
+                "title": title, "http": http, "source_url": url}
     except Exception as exc:
-        return {"status": "error", "reason": str(exc)[:300]}
+        return {"status": "error", "reason": str(exc)[:300], "source_url": url}
     finally:
         page.close()
 
@@ -122,6 +122,15 @@ def main():
                 if not should_run(event, now) and os.environ.get("FORCE_CHECK") != "1":
                     continue
                 result = inspect(browser, event)
+                if result.get("status") == "unknown" and event.get("schedule_url"):
+                    fallback = dict(event)
+                    fallback["schedule_url"] = ""
+                    product_result = inspect(browser, fallback)
+                    if product_result.get("status") == "unverified_count":
+                        result = product_result
+                    else:
+                        result["product_page_status"] = product_result.get("status")
+                        result["product_page_reason"] = product_result.get("reason")
                 item = {"id": event.get("id"), "name": event.get("name"),
                         "url": event.get("url"), **result}
                 report["events"].append(item)
