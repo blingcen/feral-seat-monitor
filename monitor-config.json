@@ -1,8 +1,21 @@
 {
+  "version": 2,
   "enabled": true,
-  "interval_minutes": 5,
-  "email": "vlln5330@hotmail.com",
-  "target_date": "2026-11-29",
-  "product_url": "https://www.ticketlink.co.kr/global/en/product/65790",
-  "last_checked_at": null
+  "default_interval_minutes": 5,
+  "notification_email": "vlln5330@hotmail.com",
+  "events": [
+    {
+      "id": "minho-feral-20261129",
+      "name": "MINHO CONCERT — FERAL Seats",
+      "url": "https://www.ticketlink.co.kr/global/en/product/65790",
+      "schedule_url": "https://www.ticketlink.co.kr/global/en/reserve/plan/schedule/1239703685",
+      "date": "2026-11-29",
+      "seat_keywords": [
+        "FERAL",
+        "페럴"
+      ],
+      "enabled": true,
+      "interval_minutes": 5
+    }
+  ]
 }
